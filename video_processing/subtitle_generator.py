@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import re
 import pysubs2
 
-from .models import WordTimestamp
+from core.models import WordTimestamp
 
 # Configure logging
 logger = logging.getLogger(__name__)
