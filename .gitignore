@@ -1,0 +1,40 @@
+# Virtual Environment
+backend_v2/venv/
+venv/
+
+# Secrets
+.env
+.env.local
+token.json
+credentials.json
+client_secrets.json
+backend_v2/client_secrets.json
+backend_v2/youtube/token.json
+env
+
+# Python Cache
+**/__pycache__/
+*.pyc
+
+# Outputs, Cache & Temporary files
+cache/
+outputs/
+backend_v2/outputs/
+backend_v2/cache/
+backend_v2/uploads/
+timing_debug.json
+title_card.png
+title_card_preview.png
+
+# Pipeline State & Logs
+backend_v2/data/pipeline/
+backend_v2/data/pipeline_stats.json
+backend_v2/data/processed_posts.json
+
+# Media files 
+*.mp4
+*.mov
+
+# Cline Memory Bank - Branch specific state
+memory-bank/activeContext.md
+memory-bank/progress.md

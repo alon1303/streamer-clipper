@@ -1,0 +1,9 @@
+moviepy
+openai # בשביל לעבוד עם ה-API של DeepSeek ו-Groq
+yt-dlp
+opencv-python # ל-Face tracking
+mediapipe # ל-Face tracking
+google-api-python-client # ליוטיוב
+google-auth-oauthlib # ליוטיוב
+google-auth-httplib2 # ליוטיוב
+python-dotenv
