@@ -1,123 +1,220 @@
 """
-Video Composer for Streamer Clipper.
-Takes a vertical (9:16) cropped video and bakes dynamic subtitles onto it.
+Smart Streamer Clipper Pipeline.
+Uses Chat Velocity (Hype) to find clips, transcribes only small chunks, and renders vertical video.
 """
 
-import logging
+import os
+import re
+import tempfile
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import Tuple, List, Dict, Any, Optional
+import ffmpeg
+import logging
 
+from core.transcriber import AudioTranscriber
+from core.ai_analyzer import AIAnalyzer
+from core.chat_analyzer import ChatAnalyzer
 from core.models import WordTimestamp
-from video_processing.subtitle_generator import SubtitleGenerator
+from video_processing.subtitle_generator import SubtitleGenerator, WordTimestamp as SubtitleWordTimestamp
 
 # Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class VideoComposer:
-    """Composes the final vertical video by baking subtitles into it."""
-    
-    def __init__(self):
-        logger.info("VideoComposer initialized for Streamer Clipper")
-    
-    def create_subtitles(
-        self,
-        word_timestamps: List[WordTimestamp],
-        audio_duration: float,
-        output_path: Path
-    ) -> bool:
-        """
-        Creates the ASS subtitle file using exact word timestamps.
-        
-        Args:
-            word_timestamps: List of WordTimestamp objects from the transcription AI
-            audio_duration: Duration of the video/audio clip in seconds
-            output_path: Path to save the .ass file
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        generator = SubtitleGenerator(
-            video_width=1080,
-            video_height=1920,
-            max_words_per_phrase=5,
-            min_words_per_phrase=2,
-            max_phrase_duration=3.0,
-            min_gap_between_phrases=0.1
-        )
-        
-        logger.info(f"Generating subtitles for {len(word_timestamps)} words...")
-        
-        success = generator.generate_ass_from_word_timestamps(
-            word_timestamps=word_timestamps,
-            audio_duration=audio_duration,
-            output_path=output_path
-        )
-        
-        if not success:
-            logger.error("Failed to generate ASS subtitles")
-            
-        return success
+def get_video_dimensions(input_path: str) -> Tuple[int, int]:
+    try:
+        probe = ffmpeg.probe(input_path)
+        video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+        if video_stream:
+            return int(video_stream['width']), int(video_stream['height'])
+    except Exception as e:
+        logger.error(f"Error getting video dimensions: {e}")
+    return 1920, 1080
 
-    def bake_subtitles_to_video(
-        self,
-        video_path: Path,
-        subtitle_path: Path,
-        output_path: Path
-    ) -> bool:
-        """
-        Bakes the ASS subtitles into the video using FFmpeg.
-        Assumes the input video is already cropped to 9:16.
-        
-        Args:
-            video_path: Path to the cropped 9:16 video (contains original audio)
-            subtitle_path: Path to the generated .ass file
-            output_path: Path to save the final MP4 video
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        if not video_path.exists():
-            logger.error(f"Input video not found: {video_path}")
-            return False
-            
-        if not subtitle_path.exists():
-            logger.error(f"Subtitle file not found: {subtitle_path}")
-            return False
+def get_video_framerate(input_path: str) -> float:
+    try:
+        probe = ffmpeg.probe(input_path)
+        video_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'video'), None)
+        if video_stream:
+            fps_str = video_stream.get('avg_frame_rate', '30/1')
+            if '/' in fps_str:
+                num, den = map(int, fps_str.split('/'))
+                return num / den
+            return float(fps_str)
+    except Exception as e:
+        logger.error(f"Error getting video framerate: {e}")
+    return 30.0
 
+def adjust_timestamps_for_clip(words: List[WordTimestamp], start_time: float, end_time: float) -> List[SubtitleWordTimestamp]:
+    clip_words = []
+    for w in words:
+        if w.end > start_time and w.start < end_time:
+            new_start = max(0.0, w.start - start_time)
+            new_end = max(0.0, w.end - start_time)
+            clip_words.append(SubtitleWordTimestamp(word=w.word, start=new_start, end=new_end, confidence=w.confidence))
+    return clip_words
+
+def generate_ass_subtitles(clip_words: List[SubtitleWordTimestamp], output_path: str, video_width: int = 1080, video_height: int = 1920) -> bool:
+    try:
+        if not clip_words:
+            return False
+        audio_duration = max(word.end for word in clip_words)
+        generator = SubtitleGenerator(video_width=video_width, video_height=video_height)
+        return generator.generate_ass_from_word_timestamps(clip_words, audio_duration, Path(output_path))
+    except Exception as e:
+        logger.error(f"Error generating ASS subtitles: {e}")
+        return False
+
+def calculate_crop_parameters(width: int, height: int) -> Tuple[str, str, str, str]:
+    target_aspect_w, target_aspect_h = 9, 16
+    if width / height > target_aspect_w / target_aspect_h:
+        crop_height = height
+        crop_width = int(height * target_aspect_w / target_aspect_h)
+    else:
+        crop_width = width
+        crop_height = int(width * target_aspect_h / target_aspect_w)
+    x_offset = max(0, (width - crop_width) // 2)
+    y_offset = max(0, (height - crop_height) // 2)
+    return str(crop_width), str(crop_height), str(x_offset), str(y_offset)
+
+def reframe_to_916_with_subtitles(input_path: str, output_path: str, subtitle_path: str, start_time: float, duration: float) -> bool:
+    try:
+        width, height = get_video_dimensions(input_path)
+        fps = get_video_framerate(input_path)
+        crop_w, crop_h, x, y = calculate_crop_parameters(width, height)
+        
+        subtitle_dir = os.path.dirname(subtitle_path)
+        subtitle_filename = os.path.basename(subtitle_path)
+        
+        abs_input_path = os.path.abspath(input_path)
+        abs_output_path = os.path.abspath(output_path)
+        
+        input_stream = ffmpeg.input(abs_input_path, ss=start_time, t=duration)
+        video = input_stream.video.filter('crop', crop_w, crop_h, x, y).filter('scale', 1080, 1920).filter('subtitles', subtitle_filename)
+        
+        cmd = ffmpeg.output(
+            video, input_stream.audio, abs_output_path,
+            vcodec='libx264', crf=23, preset='fast', pix_fmt='yuv420p',
+            acodec='aac', audio_bitrate='128k', movflags='+faststart', r=fps
+        ).overwrite_output().compile()
+        
+        original_cwd = os.getcwd()
         try:
-            # Note: We need to escape backslashes for Windows paths in the FFmpeg filter
-            safe_subtitle_path = str(subtitle_path).replace('\\', '\\\\')
+            os.chdir(subtitle_dir)
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        finally:
+            os.chdir(original_cwd)
             
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', str(video_path),
-                '-vf', f"subtitles='{safe_subtitle_path}'",
-                '-c:v', 'libx264',
-                '-preset', 'veryfast',
-                '-crf', '23',
-                '-pix_fmt', 'yuv420p',
-                '-c:a', 'copy',  # Just copy the original audio, no need to re-encode!
-                '-movflags', '+faststart',
-                str(output_path)
-            ]
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        logger.error(f"Error processing video: {e}")
+        return False
+
+def extract_audio_segment(input_audio: str, output_audio: str, start_time: float, duration: float) -> bool:
+    """חותך רק קטע קצרצר מהאודיו כדי לא לתמלל 5 שעות סתם."""
+    try:
+        subprocess.run([
+            'ffmpeg', '-y', '-ss', str(start_time), '-t', str(duration),
+            '-i', input_audio, '-c', 'copy', output_audio
+        ], capture_output=True, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to extract audio segment: {e.stderr}")
+        return False
+
+def process_stream_into_clips(input_video_path: str, input_audio_path: str, chat_path: Optional[str], output_dir: str) -> Dict[str, Any]:
+    try:
+        logger.info(f"Starting Smart Streamer Clipper pipeline for: {input_video_path}")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        transcriber = AudioTranscriber()
+        analyzer = AIAnalyzer()
+        chat_analyzer = ChatAnalyzer()
+        
+        processed_files = []
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
             
-            logger.info(f"Baking subtitles into video: {video_path.name}")
-            logger.debug(f"FFmpeg command: {' '.join(cmd)}")
+            # שלב 1: מציאת ההייפ מהצ'אט
+            hype_moments = []
+            if chat_path and os.path.exists(chat_path):
+                logger.info("Step 1: Analyzing Chat for Hype Moments...")
+                hype_moments = chat_analyzer.find_hype_moments(Path(chat_path), top_k=5, clip_duration=60)
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            if not hype_moments:
+                logger.warning("No chat data or no hype found. Extracting only the first 60 seconds as fallback to save API costs.")
+                hype_moments = [{"start_time": 0.0, "end_time": 60.0, "score": 0, "reason": "Fallback - No Chat"}]
+                
+            logger.info(f"Found {len(hype_moments)} potential viral moments based on chat!")
             
-            if result.returncode != 0:
-                logger.error(f"FFmpeg failed: {result.stderr}")
-                return False
+            # שלב 2: עיבוד נקודתי של כל רגע הייפ
+            for idx, hype in enumerate(hype_moments, 1):
+                base_start = hype['start_time']
+                base_end = hype['end_time']
+                chunk_duration = base_end - base_start
+                
+                logger.info(f"\n--- Processing Hype Area {idx}/{len(hype_moments)} (Time: {base_start}s to {base_end}s) ---")
+                
+                # גוזרים רק את ה-60 שניות הספציפיות מקובץ האודיו (חוסך המון טוקנים!)
+                chunk_audio = temp_path / f"chunk_{idx}.mp3"
+                if not extract_audio_segment(input_audio_path, str(chunk_audio), base_start, chunk_duration):
+                    continue
+                
+                # מתמללים רק את ה-60 שניות האלה!
+                logger.info(f"Transcribing short chunk {idx}...")
+                words = transcriber.transcribe(chunk_audio, language="en") # שנה לשפה הרצויה
+                
+                if not words:
+                    logger.warning(f"No speech found in chunk {idx}. Skipping.")
+                    continue
+                
+                # נותנים ל-AI לזקק את המילים ולמצוא את הפאנץ' הכי טוב בפנים
+                logger.info(f"Asking AI to refine the clip and generate title...")
+                clips = analyzer.find_viral_clips(words)
+                
+                if not clips:
+                    logger.warning(f"AI couldn't find a strong punchline in chunk {idx}. Skipping.")
+                    continue
+                    
+                # לוקחים את הקליפ הכי טוב שה-AI מצא בתוך החתיכה הזאת
+                best_clip = clips[0]
+                relative_start = float(best_clip.get("start_time", 0))
+                relative_end = float(best_clip.get("end_time", chunk_duration))
+                title = best_clip.get("title", f"viral_clip_{idx}")
+                
+                # מחשבים מחדש את הזמן המוחלט ביחס לסטרים המלא (עבור FFmpeg)
+                absolute_start = base_start + relative_start
+                absolute_end = base_start + relative_end
+                clip_duration = absolute_end - absolute_start
+                
+                clean_title = re.sub(r'[^a-zA-Z0-9א-ת]', '_', title).strip('_')
+                final_output = Path(output_dir) / f"{clean_title}.mp4"
+                subtitle_file = temp_path / f"subs_{idx}.ass"
+                
+                logger.info(f"Refined Clip: '{title}' ({clip_duration:.1f}s) - starting at {absolute_start}s")
+                
+                # מסננים ומאפסים את המילים בשביל הכתוביות
+                clip_words = adjust_timestamps_for_clip(words, relative_start, relative_end)
+                
+                if not generate_ass_subtitles(clip_words, str(subtitle_file)):
+                    logger.error(f"Failed to generate subtitles for clip {idx}")
+                    continue
+                
+                logger.info(f"Baking subtitles & cropping to 9:16 for clip {idx}...")
+                if reframe_to_916_with_subtitles(input_video_path, str(final_output), str(subtitle_file), absolute_start, clip_duration):
+                    processed_files.append(str(final_output))
+                    logger.info(f"✅ Created: {final_output.name}")
+                else:
+                    logger.error(f"❌ Failed to render clip {idx}")
+                    
+            return {
+                'success': True,
+                'videos_created': len(processed_files),
+                'files': processed_files
+            }
             
-            if not output_path.exists() or output_path.stat().st_size == 0:
-                logger.error(f"Output file not created or is empty: {output_path}")
-                return False
-            
-            logger.info(f"Final vertical video created successfully: {output_path}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Exception during video composition: {e}")
-            return False
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}")
+        return {'success': False, 'error': str(e)}

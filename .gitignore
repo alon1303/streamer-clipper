@@ -19,12 +19,14 @@ env
 # Outputs, Cache & Temporary files
 cache/
 outputs/
+output/
 backend_v2/outputs/
 backend_v2/cache/
 backend_v2/uploads/
 timing_debug.json
 title_card.png
 title_card_preview.png
+temp/
 
 # Pipeline State & Logs
 backend_v2/data/pipeline/
