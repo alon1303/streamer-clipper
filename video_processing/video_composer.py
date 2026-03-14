@@ -112,7 +112,6 @@ def reframe_to_916_with_subtitles(input_path: str, output_path: str, subtitle_pa
         return False
 
 def extract_audio_segment(input_audio: str, output_audio: str, start_time: float, duration: float) -> bool:
-    """חותך רק קטע קצרצר מהאודיו כדי לא לתמלל 5 שעות סתם."""
     try:
         subprocess.run([
             'ffmpeg', '-y', '-ss', str(start_time), '-t', str(duration),
@@ -124,9 +123,17 @@ def extract_audio_segment(input_audio: str, output_audio: str, start_time: float
         return False
 
 def process_stream_into_clips(input_video_path: str, input_audio_path: str, chat_path: Optional[str], output_dir: str) -> Dict[str, Any]:
+    """
+    מנהל את כל תהליך יצירת הקליפים.
+    מעודכן: אם אין צ'אט או אין הייפ, הפונקציה עוצרת מיד.
+    """
     try:
         logger.info(f"Starting Smart Streamer Clipper pipeline for: {input_video_path}")
         os.makedirs(output_dir, exist_ok=True)
+        
+        if not chat_path or not os.path.exists(chat_path):
+            logger.error("❌ CRITICAL ERROR: Chat file is missing. Aborting pipeline as requested.")
+            return {'success': False, 'error': 'Missing chat file'}
         
         transcriber = AudioTranscriber()
         analyzer = AIAnalyzer()
@@ -138,16 +145,14 @@ def process_stream_into_clips(input_video_path: str, input_audio_path: str, chat
             temp_path = Path(temp_dir)
             
             # שלב 1: מציאת ההייפ מהצ'אט
-            hype_moments = []
-            if chat_path and os.path.exists(chat_path):
-                logger.info("Step 1: Analyzing Chat for Hype Moments...")
-                hype_moments = chat_analyzer.find_hype_moments(Path(chat_path), top_k=5, clip_duration=60)
+            logger.info("Step 1: Analyzing Chat for Hype Moments...")
+            hype_moments = chat_analyzer.find_hype_moments(Path(chat_path), top_k=5, clip_duration=60)
             
             if not hype_moments:
-                logger.warning("No chat data or no hype found. Extracting only the first 60 seconds as fallback to save API costs.")
-                hype_moments = [{"start_time": 0.0, "end_time": 60.0, "score": 0, "reason": "Fallback - No Chat"}]
+                logger.error("❌ ERROR: No hype moments found in chat. Aborting to save tokens.")
+                return {'success': False, 'error': 'No hype moments detected'}
                 
-            logger.info(f"Found {len(hype_moments)} potential viral moments based on chat!")
+            logger.info(f"✅ Found {len(hype_moments)} viral moments based on chat velocity.")
             
             # שלב 2: עיבוד נקודתי של כל רגע הייפ
             for idx, hype in enumerate(hype_moments, 1):
@@ -155,36 +160,28 @@ def process_stream_into_clips(input_video_path: str, input_audio_path: str, chat
                 base_end = hype['end_time']
                 chunk_duration = base_end - base_start
                 
-                logger.info(f"\n--- Processing Hype Area {idx}/{len(hype_moments)} (Time: {base_start}s to {base_end}s) ---")
+                logger.info(f"\n--- Processing Hype Moment {idx}/{len(hype_moments)} ---")
                 
-                # גוזרים רק את ה-60 שניות הספציפיות מקובץ האודיו (חוסך המון טוקנים!)
+                # גוזרים רק את האודיו הספציפי
                 chunk_audio = temp_path / f"chunk_{idx}.mp3"
                 if not extract_audio_segment(input_audio_path, str(chunk_audio), base_start, chunk_duration):
                     continue
                 
-                # מתמללים רק את ה-60 שניות האלה!
-                logger.info(f"Transcribing short chunk {idx}...")
-                words = transcriber.transcribe(chunk_audio, language="en") # שנה לשפה הרצויה
-                
+                # תמלול נקודתי
+                words = transcriber.transcribe(chunk_audio, language="en")
                 if not words:
-                    logger.warning(f"No speech found in chunk {idx}. Skipping.")
                     continue
                 
-                # נותנים ל-AI לזקק את המילים ולמצוא את הפאנץ' הכי טוב בפנים
-                logger.info(f"Asking AI to refine the clip and generate title...")
+                # ניתוח AI לזיקוק הקליפ
                 clips = analyzer.find_viral_clips(words)
-                
                 if not clips:
-                    logger.warning(f"AI couldn't find a strong punchline in chunk {idx}. Skipping.")
                     continue
                     
-                # לוקחים את הקליפ הכי טוב שה-AI מצא בתוך החתיכה הזאת
                 best_clip = clips[0]
                 relative_start = float(best_clip.get("start_time", 0))
                 relative_end = float(best_clip.get("end_time", chunk_duration))
                 title = best_clip.get("title", f"viral_clip_{idx}")
                 
-                # מחשבים מחדש את הזמן המוחלט ביחס לסטרים המלא (עבור FFmpeg)
                 absolute_start = base_start + relative_start
                 absolute_end = base_start + relative_end
                 clip_duration = absolute_end - absolute_start
@@ -193,21 +190,12 @@ def process_stream_into_clips(input_video_path: str, input_audio_path: str, chat
                 final_output = Path(output_dir) / f"{clean_title}.mp4"
                 subtitle_file = temp_path / f"subs_{idx}.ass"
                 
-                logger.info(f"Refined Clip: '{title}' ({clip_duration:.1f}s) - starting at {absolute_start}s")
-                
-                # מסננים ומאפסים את המילים בשביל הכתוביות
+                # יצירת כתוביות וחיתוך
                 clip_words = adjust_timestamps_for_clip(words, relative_start, relative_end)
-                
-                if not generate_ass_subtitles(clip_words, str(subtitle_file)):
-                    logger.error(f"Failed to generate subtitles for clip {idx}")
-                    continue
-                
-                logger.info(f"Baking subtitles & cropping to 9:16 for clip {idx}...")
-                if reframe_to_916_with_subtitles(input_video_path, str(final_output), str(subtitle_file), absolute_start, clip_duration):
-                    processed_files.append(str(final_output))
-                    logger.info(f"✅ Created: {final_output.name}")
-                else:
-                    logger.error(f"❌ Failed to render clip {idx}")
+                if generate_ass_subtitles(clip_words, str(subtitle_file)):
+                    if reframe_to_916_with_subtitles(input_video_path, str(final_output), str(subtitle_file), absolute_start, clip_duration):
+                        processed_files.append(str(final_output))
+                        logger.info(f"✅ Created: {final_output.name}")
                     
             return {
                 'success': True,

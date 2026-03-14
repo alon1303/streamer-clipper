@@ -1,10 +1,9 @@
 import logging
+import subprocess
 import json
+import re
 from pathlib import Path
 from typing import Tuple, Optional
-import yt_dlp
-from yt_dlp.utils import download_range_func
-from chat_downloader import ChatDownloader
 
 logger = logging.getLogger(__name__)
 
@@ -12,88 +11,58 @@ class VideoDownloader:
     def __init__(self, temp_dir: str = "temp"):
         self.temp_dir = Path(temp_dir)
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.cli_path = "./TwitchDownloaderCLI.exe" 
         logger.info(f"VideoDownloader initialized. Temp directory: {self.temp_dir}")
 
-    def download_chat(self, url: str, video_id: str, duration_limit: Optional[int] = None) -> Optional[Path]:
-        logger.info("Downloading full chat via yt-dlp (Twitch API restricts partial downloads)...")
-        
-        ydl_opts = {
-            'skip_download': True,         # מוריד רק את הצ'אט, מדלג על הוידאו והאודיו!
-            'writesubtitles': True,
-            'subtitleslangs': ['rechat', 'live_chat'], # 'rechat' זה הפורמט של טוויץ'
-            'subtitlesformat': 'vtt',      # נמיר ל-VTT כדי שיהיה קל לנתח
-            'outtmpl': str(self.temp_dir / f"{video_id}.%(ext)s"),
-            'quiet': False                 # משאיר את הלוגים כדי שתראה שזה רץ ולא תקוע
-        }
-        
+    def _extract_video_id(self, url: str) -> Optional[str]:
+        match = re.search(r"videos/(\d+)", url)
+        return match.group(1) if match else None
+
+    def _optimize_chat_file(self, json_path: Path):
+        """קורא את ה-JSON המלא ומשאיר רק רשימת זמנים (Timestamps)."""
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-                
-            # חיפוש קובץ ה-VTT שנוצר
-            for file in self.temp_dir.glob(f"{video_id}*.vtt"):
-                logger.info(f"✅ Chat downloaded successfully: {file.name}")
-                return file
-                
-            logger.error("Chat file not found after download.")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to download chat via yt-dlp: {e}")
-            return None
-        
+            logger.info(f"Optimizing chat file for analysis...")
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
             
-    def download(self, url: str, duration_limit_seconds: Optional[int] = None) -> Optional[Tuple[Path, Path, Optional[Path]]]:
-        # 1. משיכת מזהה הסרטון
-        try:
-            with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                video_id = info.get('id', 'unknown')
+            comments = data.get('comments', [])
+            timestamps = [comment.get('content_offset_seconds') for comment in comments]
+            timestamps = [t for t in timestamps if t is not None]
+            
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump({"timestamps": timestamps}, f)
+                
+            logger.info(f"✅ Optimization complete. Kept {len(timestamps)} messages.")
         except Exception as e:
-            logger.error(f"Failed to fetch video info: {e}")
-            return None
+            logger.error(f"Failed to optimize chat JSON: {e}")
 
-        # 2. הורדת הצ'אט תחילה (מהיר ומוגבל בזמן)
-        chat_path = self.download_chat(url, video_id, duration_limit_seconds)
-        
-        if not chat_path:
-            logger.error("❌ No Live Chat found or failed to download! Aborting to save time.")
-            return None
-
-        # 3. הורדת הוידאו והאודיו
-        output_template = str(self.temp_dir / "%(id)s.%(ext)s")
-        ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'outtmpl': output_template,
-            'keepvideo': True,
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'quiet': False,
-            'no_warnings': True,
-            # ביטלנו כאן את הורדת הכתוביות של yt-dlp כי אנחנו משתמשים ב-chat-downloader
-        }
-        
-        if duration_limit_seconds:
-            logger.info(f"Test mode: Limiting video download to first {duration_limit_seconds} seconds.")
-            ydl_opts['download_ranges'] = download_range_func(None, [(0, duration_limit_seconds)])
+    def download_chat(self, video_id: str, duration_limit: int) -> Optional[Path]:
+        """מוריד את הצ'אט ומציג התקדמות בזמן אמת בטרמינל."""
+        output_path = self.temp_dir / f"{video_id}_chat.json"
+        logger.info(f"Downloading Twitch chat for ID: {video_id} (0 to {duration_limit}s)")
         
         try:
-            logger.info(f"Starting video/audio download for URL: {url}")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-                
-                video_path = self.temp_dir / f"{video_id}.mp4"
-                audio_path = self.temp_dir / f"{video_id}.mp3"
-                
-                if video_path.exists() and audio_path.exists():
-                    logger.info("✅ Successfully downloaded video and audio files.")
-                    return video_path, audio_path, chat_path
-                else:
-                    logger.error("Download completed but video/audio files are missing.")
-                    return None
-                    
-        except Exception as e:
-            logger.error(f"Failed to download video: {e}")
+            cmd = [
+                self.cli_path, "chatdownload",
+                "--id", video_id,
+                "-b", "0s",
+                "-e", f"{duration_limit}s",
+                "-o", str(output_path)
+            ]
+            
+            # הרצה ללא capture_output כדי שהמשתמש יראה את הפלט בטרמינל
+            result = subprocess.run(cmd)
+            
+            if result.returncode == 0 and output_path.exists():
+                self._optimize_chat_file(output_path)
+                return output_path
             return None
+        except Exception as e:
+            logger.error(f"Failed to download chat: {e}")
+            return None
+
+    def download(self, url: str, duration_limit_seconds: int = 1800):
+        """מתודה לשימוש ב-Test בלבד להורדת צ'אט."""
+        video_id = self._extract_video_id(url)
+        if not video_id: return None
+        return self.download_chat(video_id, duration_limit_seconds)
